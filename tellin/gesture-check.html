@@ -1,0 +1,418 @@
+<!doctype html>
+<!--
+  제스처 노드 확인용 페이지 — day4/dashboard/index.html 을 제스처 하나만 보도록 줄인 것.
+
+  용도는 "모델이 지금 뭘로 보고 있나"를 눈으로 확인하는 것 하나다. 그래서 비전 노드,
+  원시센서 그리드(조도/온습도/기압)는 전부 뺐고, 제스처 판정에 실제로 영향을 주는 것만
+  남겼다 — 라벨 / 확신도 / 클래스별 점수 / 가속도 |a| 실시간 파형 / 같은 라벨 유지 시간.
+
+  브라우저는 raw TCP 를 못 열기 때문에 MQTT 를 WebSocket 위에 얹어 구독한다.
+  (mosquitto: 1883=보드, 9001=브라우저)
+
+  구독 토픽:  wearable/{id}/gesture
+  페이로드 (10_gesture_node 가 발행하는 것과 동일):
+    {
+      "node":"gesture", "kind":"imu", "uptime_s":42, "rssi":-55,
+      "sensors": { "accel":{"v":0.42,"unit":"m/s²",...}, "ax":{...}, ... },
+      "inference": { "label":"shaking","confidence":0.92,
+                     "scores":{"idle":0.02,"shaking":0.92,"spin":0.06},
+                     "dsp_ms":3,"nn_ms":1 }
+    }
+  클래스 목록은 하드코딩하지 않는다 — scores 키를 그대로 그리므로, 모델을 재학습해
+  라벨이 바뀌어도 이 파일은 손댈 필요가 없다.
+-->
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>제스처 확인</title>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+:root{
+  --bg:#0b0d12; --bg2:#12151d;
+  --card:rgba(255,255,255,.035); --card-hi:rgba(255,255,255,.06);
+  --line:rgba(255,255,255,.08);
+  --text:#eef1f7; --muted:#7d879c;
+  --accent:#5b9dff; --ok:#35d07f; --warn:#ffb84d; --off:#ff5f57;
+  --tint:#5b9dff;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.6);
+  --r:16px;
+}
+@media (prefers-color-scheme:light){
+  :root{
+    --bg:#eef1f6; --bg2:#f8fafc; --card:#fff; --card-hi:#fff;
+    --line:rgba(15,23,42,.09); --text:#0f172a; --muted:#64748b;
+    --shadow:0 1px 2px rgba(15,23,42,.06),0 12px 28px -18px rgba(15,23,42,.4);
+  }
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{
+  min-height:100vh;
+  background:
+    radial-gradient(1100px 600px at 12% -10%, rgba(91,157,255,.13), transparent 60%),
+    radial-gradient(900px 500px at 105% 8%, rgba(53,208,127,.10), transparent 55%),
+    var(--bg);
+  color:var(--text);
+  font:15px/1.55 -apple-system,"Segoe UI Variable Text","Segoe UI",system-ui,"Pretendard",sans-serif;
+  padding:32px 20px 64px;
+}
+.wrap{max-width:820px;margin:0 auto}
+
+header{display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:22px}
+h1{font-size:26px;font-weight:680;letter-spacing:-.02em}
+h1 span{background:linear-gradient(92deg,var(--accent),#9b7bff);
+        -webkit-background-clip:text;background-clip:text;color:transparent}
+.tag{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+     color:var(--muted);border:1px solid var(--line);border-radius:999px;
+     padding:4px 10px;margin-bottom:4px}
+
+/* ---------- 연결 바 ---------- */
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+     background:var(--card);border:1px solid var(--line);
+     border-radius:var(--r);padding:12px 14px;margin-bottom:18px;
+     box-shadow:var(--shadow);backdrop-filter:blur(12px)}
+.field{display:flex;align-items:center;gap:7px}
+.field label{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+input{background:var(--bg2);color:var(--text);border:1px solid var(--line);border-radius:9px;
+      padding:8px 11px;font:inherit;font-size:14px;transition:border-color .15s,box-shadow .15s}
+input:focus{outline:0;border-color:var(--accent);box-shadow:0 0 0 3px rgba(91,157,255,.16)}
+#host{width:150px}#port{width:74px}#sid{width:118px}
+button{border:0;border-radius:9px;padding:9px 18px;font:inherit;font-size:14px;font-weight:600;
+       color:#fff;background:linear-gradient(180deg,var(--accent),#3f7fe0);cursor:pointer;
+       transition:transform .12s,filter .15s,opacity .15s}
+button:hover:not(:disabled){filter:brightness(1.08)}
+button:active:not(:disabled){transform:translateY(1px)}
+button:disabled{opacity:.38;cursor:not-allowed}
+button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+.status{display:flex;align-items:center;gap:8px;margin-left:auto;font-size:13px;color:var(--muted)}
+.dot{position:relative;width:9px;height:9px;border-radius:50%;background:var(--off);transition:background .25s}
+.dot.on{background:var(--ok)}
+.dot.on::after{content:"";position:absolute;inset:-5px;border-radius:50%;
+               border:1.5px solid var(--ok);animation:pulse 1.9s ease-out infinite}
+@keyframes pulse{0%{opacity:.7;transform:scale(.6)}100%{opacity:0;transform:scale(1.5)}}
+
+/* ---------- 카드 ---------- */
+.card{position:relative;overflow:hidden;background:var(--card);border:1px solid var(--line);
+      border-radius:var(--r);padding:18px 18px 20px;box-shadow:var(--shadow);
+      backdrop-filter:blur(12px);transition:opacity .3s}
+.card::before{content:"";position:absolute;inset:0 0 auto 0;height:2px;
+              background:linear-gradient(90deg,var(--tint),transparent 72%)}
+.card.stale{opacity:.34}
+.card + .card{margin-top:16px}
+.nhead{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.nhead h2{font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase}
+.nhead .kind{font-size:11px;color:var(--muted);border:1px solid var(--line);
+             border-radius:999px;padding:3px 9px}
+.nhead .meta{margin-left:auto;font-size:11px;color:var(--muted);
+             font-variant-numeric:tabular-nums;text-align:right;line-height:1.4}
+.sec{font-size:10.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+     color:var(--muted);margin:4px 0 10px;display:flex;align-items:center;gap:8px}
+.sec::after{content:"";flex:1;height:1px;background:var(--line)}
+
+/* ---------- 추론 결과 ---------- */
+.infer{display:flex;gap:16px;align-items:center;margin-bottom:6px}
+.ring{position:relative;width:112px;height:112px;flex:none}
+.ring svg{width:100%;height:100%;transform:rotate(-90deg)}
+.ring .bg{fill:none;stroke:var(--line);stroke-width:9}
+.ring .fg{fill:none;stroke:var(--tint);stroke-width:9;stroke-linecap:round;
+          transition:stroke-dashoffset .4s cubic-bezier(.2,.8,.2,1)}
+.ring .txt{position:absolute;inset:0;display:flex;flex-direction:column;
+           align-items:center;justify-content:center;gap:1px}
+.ring .pct{font-size:23px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.ring .cap{font-size:9.5px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase}
+.ilabel{min-width:0}
+.ilabel .big{font-size:38px;font-weight:650;letter-spacing:-.02em;
+             text-transform:uppercase;line-height:1.12;word-break:break-all}
+.ilabel .hold{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums;margin-top:6px}
+.ilabel .lat{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums;margin-top:3px}
+
+.scores{margin-top:14px;display:flex;flex-direction:column;gap:8px}
+.srow{display:grid;grid-template-columns:88px 1fr 44px;align-items:center;gap:10px}
+.srow .nm{font-size:12.5px;font-weight:550;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.srow .tr{height:9px;border-radius:999px;background:var(--bg2);
+          box-shadow:inset 0 0 0 1px var(--line);overflow:hidden}
+.srow .fl{height:100%;width:0;border-radius:999px;background:var(--tint);
+          transition:width .35s cubic-bezier(.2,.8,.2,1)}
+.srow .pc{font-size:12px;text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
+.srow.top .nm{color:var(--tint)}
+.srow.top .pc{color:var(--text);font-weight:600}
+
+/* ---------- 움직임 파형 ---------- */
+.motion{display:flex;gap:14px;align-items:center}
+.motion canvas{flex:1;width:100%;height:96px;background:var(--bg2);
+               border:1px solid var(--line);border-radius:11px}
+.mnow{flex:none;width:104px;text-align:right}
+.mnow .v{font-size:26px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.mnow .u{font-size:11px;color:var(--muted);margin-left:3px;font-weight:400}
+.mnow .k{font-size:10.5px;color:var(--muted);letter-spacing:.06em;margin-top:2px}
+.hint{font-size:12px;color:var(--muted);margin-top:10px}
+
+/* ---------- 로그 ---------- */
+.logwrap{margin-top:20px}
+.logwrap h2{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+            color:var(--muted);margin-bottom:9px}
+#log{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+     padding:14px 16px;height:132px;overflow-y:auto;
+     font:12px/1.75 ui-monospace,"Cascadia Mono",Consolas,monospace;
+     color:var(--muted);white-space:pre-wrap;word-break:break-all;box-shadow:var(--shadow)}
+#log::-webkit-scrollbar{width:9px}
+#log::-webkit-scrollbar-thumb{background:var(--line);border-radius:9px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>제스처 <span>확인</span></h1>
+    <div class="tag">wearable/{id}/gesture 구독</div>
+  </header>
+
+  <div class="bar">
+    <div class="field"><label for="host">broker</label><input id="host" value="192.168.0.27"></div>
+    <div class="field"><label for="port">port</label><input id="port" value="9001"></div>
+    <div class="field"><label for="sid">id</label><input id="sid" value="minseo"></div>
+    <button id="connect">연결</button>
+    <button id="disconnect" class="ghost" disabled>끊기</button>
+    <div class="status"><span class="dot" id="dot"></span><span id="stateText">연결 안 됨</span></div>
+  </div>
+
+  <section class="card stale" id="card">
+    <div class="nhead">
+      <h2>제스처 노드</h2>
+      <span class="kind">BNO055 IMU</span>
+      <span class="meta" id="meta">—</span>
+    </div>
+
+    <div class="sec">지금 무슨 동작으로 보는가</div>
+    <div class="infer">
+      <div class="ring">
+        <svg viewBox="0 0 100 100">
+          <circle class="bg" cx="50" cy="50" r="43"></circle>
+          <circle class="fg" cx="50" cy="50" r="43"
+                  stroke-dasharray="270.18" stroke-dashoffset="270.18" id="ring"></circle>
+        </svg>
+        <div class="txt">
+          <span class="pct" id="pct">—</span>
+          <span class="cap">conf</span>
+        </div>
+      </div>
+      <div class="ilabel">
+        <div class="big" id="label">—</div>
+        <div class="hold" id="hold">대기 중</div>
+        <div class="lat" id="lat">—</div>
+      </div>
+    </div>
+    <div class="scores" id="scores"></div>
+  </section>
+
+  <section class="card stale" id="mcard">
+    <div class="sec">움직임 (선형가속도 크기)</div>
+    <div class="motion">
+      <canvas id="wave"></canvas>
+      <div class="mnow">
+        <div><span class="v" id="mag">—</span><span class="u">m/s²</span></div>
+        <div class="k">|a| 현재</div>
+        <div class="k" id="magmax">피크 —</div>
+      </div>
+    </div>
+    <div class="hint">
+      idle 은 0 근처에서 거의 평평하고, shaking 은 크고 빠른 진동, spin 은 중간 크기가
+      꾸준히 이어진다. 파형이 라벨과 안 맞으면 모델이 아니라 동작 쪽을 의심할 것.
+    </div>
+  </section>
+
+  <div class="logwrap">
+    <h2>Log</h2>
+    <div id="log">대기 중…</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+const STALE_MS = 4000;      // 이 시간 동안 메시지가 없으면 카드를 흐리게
+const WAVE_N   = 160;       // 파형에 남길 샘플 수 (4 Hz 발행이면 약 40 초)
+
+let client = null, base = '';
+let seenAt = 0;
+let lastLabel = null, labelSince = 0;
+const wave = [];
+let peak = 0;
+
+function log(msg){
+  const el = $('log'), t = new Date().toLocaleTimeString();
+  el.textContent += `\n[${t}] ${msg}`;
+  el.scrollTop = el.scrollHeight;
+}
+
+// ---------- 클래스별 점수 ----------
+// scores 의 키를 그대로 그린다. 라벨이 바뀌어도 이 코드는 안 고쳐도 된다.
+function renderScores(inf){
+  const host = $('scores'), scores = inf.scores || {};
+  for(const k of Object.keys(scores)){
+    let row = host.querySelector(`[data-sc="${k}"]`);
+    if(!row){
+      row = document.createElement('div');
+      row.className = 'srow';
+      row.dataset.sc = k;
+      row.innerHTML = `<span class="nm">${k}</span>
+                       <div class="tr"><div class="fl" data-fl></div></div>
+                       <span class="pc" data-pc>0%</span>`;
+      host.appendChild(row);
+    }
+    const v = Math.max(0, Math.min(1, scores[k] || 0));
+    row.querySelector('[data-fl]').style.width = (v*100).toFixed(1) + '%';
+    row.querySelector('[data-pc]').textContent = Math.round(v*100) + '%';
+    row.classList.toggle('top', k === inf.label);
+  }
+}
+
+// ---------- 추론 결과 ----------
+const RING_C = 2 * Math.PI * 43;
+function renderInference(inf){
+  if(!inf) return;
+  const conf = Math.max(0, Math.min(1, inf.confidence || 0));
+
+  $('label').textContent = inf.label || '—';
+  $('pct').textContent   = Math.round(conf*100) + '%';
+  $('ring').style.strokeDashoffset = (RING_C * (1 - conf)).toFixed(2);
+
+  // 같은 라벨이 몇 초째 유지되는지. 알람 해제처럼 "N 초 유지" 판정을 붙이기 전에
+  // 그 동작이 실제로 안정적으로 잡히는지 여기서 먼저 확인할 수 있다.
+  const now = Date.now();
+  if(inf.label !== lastLabel){ lastLabel = inf.label; labelSince = now; }
+  $('hold').textContent = `${inf.label || '—'} 유지 ${((now - labelSince)/1000).toFixed(1)}초`;
+
+  const dsp = inf.dsp_ms|0, nn = inf.nn_ms|0;
+  $('lat').textContent = `dsp ${dsp}ms + nn ${nn}ms = ${dsp+nn}ms`;
+
+  renderScores(inf);
+}
+
+// ---------- 움직임 파형 ----------
+function drawWave(){
+  const c = $('wave');
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = c.clientWidth || 600, h = c.clientHeight || 96;
+  if(c.width !== Math.round(w*dpr) || c.height !== Math.round(h*dpr)){
+    c.width = Math.round(w*dpr); c.height = Math.round(h*dpr);
+  }
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  if(wave.length < 2) return;
+
+  // 0 을 바닥으로 고정한다. |a| 는 항상 0 이상이고, "얼마나 세게 움직였나"를
+  // 봐야 하므로 자동 스케일로 바닥을 띄우면 idle 이 크게 흔들리는 것처럼 보인다.
+  let mx = 2;
+  for(const v of wave) if(v > mx) mx = v;
+  const pad = 6;
+  const x = i => (i / (WAVE_N - 1)) * w;
+  const y = v => h - pad - (v / mx) * (h - pad*2);
+  const off = WAVE_N - wave.length;
+
+  const tint = getComputedStyle(document.documentElement).getPropertyValue('--tint').trim() || '#5b9dff';
+
+  ctx.beginPath();
+  ctx.moveTo(x(off), y(wave[0]));
+  for(let i=1;i<wave.length;i++) ctx.lineTo(x(off+i), y(wave[i]));
+  ctx.strokeStyle = tint; ctx.lineWidth = 1.8;
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.arc(x(off+wave.length-1), y(wave[wave.length-1]), 2.5, 0, Math.PI*2);
+  ctx.fillStyle = tint; ctx.fill();
+}
+
+// ---------- 메시지 수신 ----------
+function onMessage(topic, buf){
+  let d;
+  try { d = JSON.parse(buf.toString()); }
+  catch(e){ log(`JSON 파싱 실패 (${topic})`); return; }
+
+  seenAt = Date.now();
+  $('card').classList.remove('stale');
+  $('mcard').classList.remove('stale');
+
+  const rssi = typeof d.rssi === 'number' ? `${d.rssi} dBm` : '—';
+  const up   = typeof d.uptime_s === 'number' ? `${d.uptime_s}s` : '—';
+  $('meta').innerHTML = `RSSI ${rssi}<br>uptime ${up}`;
+
+  renderInference(d.inference);
+
+  // 노드는 accel(=|a|) 을 sensors 에 실어 보낸다. 없으면 ax/ay/az 로 직접 구한다.
+  const s = d.sensors || {};
+  let m = s.accel && typeof s.accel.v === 'number' ? s.accel.v : null;
+  if(m === null && s.ax && s.ay && s.az){
+    m = Math.hypot(s.ax.v, s.ay.v, s.az.v);
+  }
+  if(m !== null){
+    wave.push(m);
+    if(wave.length > WAVE_N) wave.shift();
+    if(m > peak) peak = m;
+    $('mag').textContent = m.toFixed(2);
+    $('magmax').textContent = `피크 ${peak.toFixed(2)}`;
+    drawWave();
+  }
+}
+
+// 일정 시간 소식 없으면 흐리게 (노드가 죽었는지 바로 보이도록)
+setInterval(() => {
+  const dead = !seenAt || Date.now() - seenAt > STALE_MS;
+  $('card').classList.toggle('stale', dead);
+  $('mcard').classList.toggle('stale', dead);
+}, 1000);
+
+// ---------- 연결 ----------
+function setConnected(ok){
+  $('dot').classList.toggle('on', ok);
+  $('stateText').textContent = ok ? '연결됨' : '연결 안 됨';
+  $('connect').disabled = ok;
+  $('disconnect').disabled = !ok;
+  if(!ok){ $('card').classList.add('stale'); $('mcard').classList.add('stale'); }
+}
+
+function connect(){
+  const host = $('host').value.trim(), port = $('port').value.trim(), sid = $('sid').value.trim();
+  base = `wearable/${sid}`;
+
+  // https 로 열린 페이지에서는 브라우저가 ws:// 를 막는다. 그때는 wss 가 필요하다.
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${scheme}://${host}:${port}`;
+  log(`연결 시도: ${url}`);
+
+  client = mqtt.connect(url, {
+    clientId: 'gcheck-' + Math.random().toString(16).slice(2,8),
+    reconnectPeriod: 3000,
+    connectTimeout: 8000,
+  });
+
+  client.on('connect', () => {
+    setConnected(true);
+    log('브로커 연결 성공');
+    const topic = `${base}/gesture`;
+    client.subscribe(topic, err => log(err ? '구독 실패: '+err.message : '구독: '+topic));
+  });
+  client.on('message', onMessage);
+  client.on('reconnect', () => log('재연결 시도…'));
+  client.on('close', () => setConnected(false));
+  client.on('error', err => log('에러: ' + err.message));
+}
+
+function disconnect(){
+  if(client){ client.end(true); client = null; }
+  setConnected(false);
+  log('연결 종료');
+}
+
+$('connect').onclick = connect;
+$('disconnect').onclick = disconnect;
+window.addEventListener('resize', drawWave);
+
+setConnected(false);
+</script>
+</body>
+</html>

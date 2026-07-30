@@ -1,0 +1,22 @@
+# 비밀값 — .env.example 만 올리고 실제 키가 든 .env 는 절대 올리지 않는다
+.env
+
+# 학습 데이터·모델 산출물 (용량이 크고 EI 스튜디오에서 다시 받을 수 있다)
+dataset/
+data/
+*.zip
+
+# 빌드 산출물
+build/
+*.bin
+*.elf
+*.map
+
+# 파이썬
+__pycache__/
+*.pyc
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>제스처 → 오디오 음소거</title>
+<!--
+  MQTT 로 들어오는 추론 결과를 보고 브라우저 오디오를 음소거/해제한다.
+  PC 프로그램 없음. 브라우저 안에서만 소리가 나고, 그 소리만 제어한다.
+
+      보드 ──publish──▶ mosquitto ──WebSocket(9001)──▶ 이 페이지 ──▶ WebAudio gain
+
+  페이로드는 day4 스키마({inference:{label,confidence,scores}})와
+  day3 평면 스키마({label,confidence,scores}) 둘 다 받는다.
+-->
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+:root{
+  --bg:#0b0d12; --bg2:#12151d; --card:rgba(255,255,255,.035); --card-hi:rgba(255,255,255,.06);
+  --line:rgba(255,255,255,.08); --text:#eef1f7; --muted:#7d879c;
+  --accent:#5b9dff; --ok:#35d07f; --warn:#ffb84d; --off:#ff5f57;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.6); --r:16px;
+}
+@media (prefers-color-scheme:light){
+  :root{--bg:#eef1f6;--bg2:#f8fafc;--card:#fff;--card-hi:#fff;--line:rgba(15,23,42,.09);
+        --text:#0f172a;--muted:#64748b;--shadow:0 1px 2px rgba(15,23,42,.06),0 12px 28px -18px rgba(15,23,42,.4)}
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{min-height:100vh;background:
+     radial-gradient(1100px 600px at 12% -10%,rgba(91,157,255,.13),transparent 60%),
+     radial-gradient(900px 500px at 105% 8%,rgba(53,208,127,.10),transparent 55%),var(--bg);
+     color:var(--text);font:15px/1.55 -apple-system,"Segoe UI","Pretendard",system-ui,sans-serif;
+     padding:32px 20px 64px}
+.wrap{max-width:860px;margin:0 auto}
+header{margin-bottom:22px}
+h1{font-size:26px;font-weight:680;letter-spacing:-.02em}
+h1 span{background:linear-gradient(92deg,var(--accent),#9b7bff);-webkit-background-clip:text;
+        background-clip:text;color:transparent}
+.tag{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);
+     border:1px solid var(--line);border-radius:999px;padding:4px 10px;display:inline-block;margin-top:8px}
+
+.bar,.panel{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+     padding:14px;margin-bottom:16px;box-shadow:var(--shadow)}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.field{display:flex;align-items:center;gap:7px}
+.field label{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+input,select{background:var(--bg2);color:var(--text);border:1px solid var(--line);border-radius:9px;
+     padding:8px 11px;font:inherit;font-size:14px}
+input:focus,select:focus{outline:0;border-color:var(--accent);box-shadow:0 0 0 3px rgba(91,157,255,.16)}
+#host{width:140px}#port{width:70px}#topic{width:230px}#thresh{width:66px}#need{width:56px}#cool{width:74px}
+button{border:0;border-radius:9px;padding:9px 18px;font:inherit;font-size:14px;font-weight:600;color:#fff;
+     background:linear-gradient(180deg,var(--accent),#3f7fe0);cursor:pointer;transition:filter .15s,opacity .15s}
+button:hover:not(:disabled){filter:brightness(1.08)}
+button:disabled{opacity:.38;cursor:not-allowed}
+button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+.status{display:flex;align-items:center;gap:8px;margin-left:auto;font-size:13px;color:var(--muted)}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--off);transition:background .25s}
+.dot.on{background:var(--ok);box-shadow:0 0 0 4px rgba(53,208,127,.16)}
+
+h2{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+
+/* 소리 상태 */
+.sound{display:flex;align-items:center;gap:18px;padding:18px;border-radius:12px;
+       background:var(--card-hi);border:1px solid var(--line);margin-bottom:14px}
+.speaker{font-size:44px;line-height:1;transition:opacity .2s,transform .2s}
+.muted .speaker{opacity:.3;transform:scale(.92)}
+.sound .txt{flex:1}
+.sound .big{font-size:22px;font-weight:700;letter-spacing:-.01em}
+.muted .big{color:var(--off)}
+.sound .sub{font-size:13px;color:var(--muted);margin-top:2px}
+
+/* 추론 상태 */
+.live{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px}
+.stat{background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.stat .k{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.stat .v{font-size:19px;font-weight:680;margin-top:4px;font-variant-numeric:tabular-nums}
+.tr{height:7px;border-radius:99px;background:var(--line);overflow:hidden;margin-top:9px}
+.fl{height:100%;width:0;border-radius:99px;background:linear-gradient(90deg,var(--accent),#9b7bff);
+    transition:width .12s linear}
+.fl.hot{background:linear-gradient(90deg,var(--ok),#7ee2a8)}
+
+#log{font:12px/1.65 ui-monospace,Consolas,monospace;color:var(--muted);white-space:pre-wrap;
+     max-height:180px;overflow:auto;background:var(--bg2);border:1px solid var(--line);
+     border-radius:10px;padding:11px 13px}
+.hint{font-size:12.5px;color:var(--muted);margin-top:10px}
+code{font:12px ui-monospace,Consolas,monospace;background:var(--card-hi);border:1px solid var(--line);
+     border-radius:5px;padding:1px 5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>제스처 → <span>오디오 음소거</span></h1>
+    <div class="tag">MQTT over WebSocket · 브라우저 내 오디오만 제어</div>
+  </header>
+
+  <!-- 연결 -->
+  <div class="bar">
+    <div class="field"><label for="host">broker</label><input id="host" value="192.168.0.27"></div>
+    <div class="field"><label for="port">port</label><input id="port" value="9001"></div>
+    <div class="field"><label for="topic">topic</label><input id="topic" value="wearable/minseo/gesture"></div>
+    <button id="connect">연결</button>
+    <button id="disconnect" class="ghost" disabled>끊기</button>
+    <div class="status"><span class="dot" id="dot"></span><span id="stateText">연결 안 됨</span></div>
+  </div>
+
+  <!-- 오디오 -->
+  <div class="panel">
+    <h2>오디오</h2>
+    <div class="sound" id="soundBox">
+      <div class="speaker" id="speaker">🔊</div>
+      <div class="txt">
+        <div class="big" id="soundState">정지됨</div>
+        <div class="sub" id="soundSub">재생을 눌러 시작하세요 (브라우저는 클릭 없이는 소리를 못 냅니다)</div>
+      </div>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label for="src">음원</label>
+        <select id="src">
+          <option value="tone">테스트 톤 (440 Hz)</option>
+          <option value="file">내 오디오 파일</option>
+        </select>
+      </div>
+      <input type="file" id="file" accept="audio/*" style="display:none">
+      <button id="play">재생</button>
+      <button id="stop" class="ghost" disabled>정지</button>
+      <button id="toggle" class="ghost" disabled>수동 음소거 토글</button>
+    </div>
+    <div class="hint">음소거는 시스템 볼륨이 아니라 이 페이지의 게인만 0으로 내립니다. 다른 앱 소리는 그대로입니다.</div>
+  </div>
+
+  <!-- 트리거 -->
+  <div class="panel">
+    <h2>트리거</h2>
+    <div class="row" style="margin-bottom:14px">
+      <div class="field">
+        <label for="label">제스처</label>
+        <select id="label"><option value="spin">spin</option></select>
+      </div>
+      <div class="field"><label for="thresh">임계값</label><input id="thresh" type="number" min="0" max="1" step="0.05" value="0.8"></div>
+      <div class="field"><label for="need">연속</label><input id="need" type="number" min="1" max="20" value="3"></div>
+      <div class="field"><label for="cool">쿨다운 ms</label><input id="cool" type="number" min="0" step="100" value="1500"></div>
+      <button id="sim" class="ghost">트리거 흉내</button>
+    </div>
+
+    <div class="live">
+      <div class="stat">
+        <div class="k">현재 라벨</div><div class="v" id="curLabel">—</div>
+      </div>
+      <div class="stat">
+        <div class="k">confidence</div><div class="v" id="curConf">—</div>
+        <div class="tr"><div class="fl" id="confBar"></div></div>
+      </div>
+      <div class="stat">
+        <div class="k">연속 프레임</div><div class="v" id="curStreak">0 / 3</div>
+        <div class="tr"><div class="fl" id="streakBar"></div></div>
+      </div>
+      <div class="stat">
+        <div class="k">수신 메시지</div><div class="v" id="curCount">0</div>
+      </div>
+    </div>
+    <div class="hint">보드가 250 ms 마다 쏘므로 제스처 한 번에 메시지가 여러 개 옵니다.
+      <b>연속</b> 프레임을 채운 순간 <b>딱 한 번만</b> 토글하고, 라벨이 풀리거나 쿨다운이 끝나야 다시 발동합니다.</div>
+  </div>
+
+  <div class="panel">
+    <h2>Log</h2>
+    <div id="log">대기 중…</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+function log(msg){
+  const el = $('log'), t = new Date().toLocaleTimeString();
+  if(el.textContent === '대기 중…') el.textContent = '';
+  el.textContent += (el.textContent ? '\n' : '') + `[${t}] ${msg}`;
+  el.scrollTop = el.scrollHeight;
+}
+
+/* ================= 오디오 =================
+   톤이든 파일이든 전부 masterGain 한 곳을 지나가게 해서,
+   음소거 경로를 하나로 만든다. gain 을 뚝 끊으면 "틱" 소리가 나므로 살짝 램프. */
+let ctx = null, masterGain = null, osc = null, elSrc = null, playing = false, muted = false;
+const audioEl = new Audio();
+audioEl.loop = true;
+
+function ensureCtx(){
+  if(ctx) return;
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  masterGain = ctx.createGain();
+  masterGain.gain.value = 1;
+  masterGain.connect(ctx.destination);
+}
+
+function setMute(on, why){
+  if(!playing || muted === on) return;
+  muted = on;
+  // 15 ms 램프: 클릭 노이즈 방지
+  masterGain.gain.setTargetAtTime(on ? 0 : 1, ctx.currentTime, 0.015);
+  paintSound();
+  log(`${on ? '음소거 ON' : '음소거 해제'} (${why})`);
+}
+
+function paintSound(){
+  $('soundBox').classList.toggle('muted', playing && muted);
+  $('speaker').textContent = !playing ? '⏹️' : (muted ? '🔇' : '🔊');
+  $('soundState').textContent = !playing ? '정지됨' : (muted ? '음소거' : '재생 중');
+  $('soundSub').textContent = !playing
+    ? '재생을 눌러 시작하세요 (브라우저는 클릭 없이는 소리를 못 냅니다)'
+    : (muted ? '제스처를 다시 하면 해제됩니다' : '제스처를 기다리는 중');
+  $('stop').disabled = !playing;
+  $('toggle').disabled = !playing;
+  $('play').disabled = playing;
+}
+
+async function play(){
+  ensureCtx();
+  await ctx.resume();                      // 자동재생 정책: 클릭 핸들러 안에서 풀어줘야 한다
+  masterGain.gain.value = 1;
+  muted = false;
+
+  if($('src').value === 'tone'){
+    osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    g.gain.value = 0.12;                   // 귀 아프지 않게
+    osc.type = 'sine';
+    osc.frequency.value = 440;
+    osc.connect(g).connect(masterGain);
+    osc.start();
+  } else {
+    if(!audioEl.src){ log('오디오 파일을 먼저 고르세요'); return; }
+    if(!elSrc) elSrc = ctx.createMediaElementSource(audioEl);  // 엘리먼트당 한 번만 가능
+    elSrc.connect(masterGain);
+    await audioEl.play();
+  }
+  playing = true;
+  paintSound();
+  log('재생 시작 — ' + ($('src').value === 'tone' ? '테스트 톤' : '파일'));
+}
+
+function stop(){
+  if(osc){ try{ osc.stop(); }catch(e){} osc.disconnect(); osc = null; }
+  audioEl.pause();
+  playing = false; muted = false;
+  paintSound();
+  log('정지');
+}
+
+$('src').onchange = () => { $('file').style.display = $('src').value === 'file' ? '' : 'none'; };
+$('file').onchange = e => {
+  const f = e.target.files[0];
+  if(!f) return;
+  audioEl.src = URL.createObjectURL(f);
+  log('파일: ' + f.name);
+};
+$('play').onclick  = () => play().catch(err => log('재생 실패: ' + err.message));
+$('stop').onclick  = stop;
+$('toggle').onclick = () => setMute(!muted, '수동');
+
+/* ================= 트리거 판정 ================= */
+let streak = 0, lastFire = 0, count = 0;
+const seenLabels = new Set(['spin']);
+
+function paintLive(label, conf){
+  const need = Math.max(1, +$('need').value || 1);
+  $('curLabel').textContent = label ?? '—';
+  $('curConf').textContent  = conf == null ? '—' : Math.round(conf * 100) + '%';
+  $('confBar').style.width  = ((conf || 0) * 100).toFixed(1) + '%';
+  $('confBar').classList.toggle('hot', (conf || 0) >= (+$('thresh').value || 0.8));
+  $('curStreak').textContent = `${streak} / ${need}`;
+  $('streakBar').style.width = Math.min(100, streak / need * 100) + '%';
+  $('streakBar').classList.toggle('hot', streak >= need);
+  $('curCount').textContent = count;
+}
+
+// 라벨 목록은 페이로드의 scores 키에서 자동으로 채운다 (모델 바꿔도 UI 그대로)
+function learnLabels(scores){
+  if(!scores) return;
+  let added = false;
+  for(const k of Object.keys(scores)) if(!seenLabels.has(k)){ seenLabels.add(k); added = true; }
+  if(!added) return;
+  const sel = $('label'), cur = sel.value;
+  sel.innerHTML = '';
+  for(const k of seenLabels){
+    const o = document.createElement('option');
+    o.value = o.textContent = k;
+    sel.appendChild(o);
+  }
+  sel.value = seenLabels.has(cur) ? cur : sel.options[0].value;
+}
+
+function evaluate(inf){
+  const target = $('label').value;
+  const th     = +$('thresh').value || 0.8;
+  const need   = Math.max(1, +$('need').value || 1);
+  const cool   = Math.max(0, +$('cool').value || 0);
+
+  const hit = inf.label === target && (inf.confidence || 0) >= th;
+  if(hit){
+    streak++;
+    // === 로 딱 한 번만. >= 로 하면 매 메시지마다 토글되며 미쳐 날뜀
+    if(streak === need){
+      if(Date.now() - lastFire < cool){
+        log(`트리거 무시 — 쿨다운 중 (${cool}ms)`);
+      } else {
+        lastFire = Date.now();
+        if(playing) setMute(!muted, `제스처 "${target}" ${Math.round(inf.confidence*100)}%`);
+        else log(`트리거 발동했지만 재생 중이 아님 ("${target}")`);
+      }
+    }
+  } else {
+    streak = 0;
+  }
+  paintLive(inf.label, inf.confidence);
+}
+
+$('sim').onclick = () => {
+  const need = Math.max(1, +$('need').value || 1);
+  const target = $('label').value;
+  log(`트리거 흉내: "${target}" ${need}프레임`);
+  for(let i = 0; i < need; i++){ count++; evaluate({label:target, confidence:0.95}); }
+  streak = 0; paintLive(target, 0.95);
+};
+
+/* ================= MQTT ================= */
+let client = null;
+
+function setConnected(ok){
+  $('dot').classList.toggle('on', ok);
+  $('stateText').textContent = ok ? '연결됨' : '연결 안 됨';
+  $('connect').disabled = ok;
+  $('disconnect').disabled = !ok;
+}
+
+function onMessage(topic, buf){
+  let d;
+  try { d = JSON.parse(buf.toString()); }
+  catch(e){ log('JSON 파싱 실패: ' + topic); return; }
+
+  // day4 는 {inference:{...}}, day3 는 평면 {label,confidence}. 둘 다 받는다.
+  const inf = d.inference || d;
+  if(typeof inf.label !== 'string'){ log('추론 필드 없음: ' + topic); return; }
+
+  count++;
+  learnLabels(inf.scores);
+  evaluate(inf);
+}
+
+function connect(){
+  const host  = $('host').value.trim();
+  const port  = $('port').value.trim();
+  const topic = $('topic').value.trim();
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${scheme}://${host}:${port}`;
+  log('연결 시도: ' + url);
+
+  client = mqtt.connect(url, {
+    clientId: 'mute-' + Math.random().toString(16).slice(2,8),
+    reconnectPeriod: 3000,
+    connectTimeout: 8000,
+  });
+
+  client.on('connect', () => {
+    setConnected(true);
+    log('브로커 연결 성공');
+    client.subscribe(topic, err => log(err ? '구독 실패: ' + err.message : '구독: ' + topic));
+  });
+  client.on('message', onMessage);
+  client.on('reconnect', () => log('재연결 시도…'));
+  client.on('close', () => setConnected(false));
+  client.on('error', err => log('에러: ' + err.message));
+}
+
+function disconnect(){
+  if(client){ client.end(true); client = null; }
+  setConnected(false);
+  log('연결 종료');
+}
+
+$('connect').onclick = connect;
+$('disconnect').onclick = disconnect;
+
+setConnected(false);
+paintSound();
+paintLive(null, null);
+</script>
+</body>
+</html>

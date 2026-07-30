@@ -1,0 +1,559 @@
+<!doctype html>
+<!--
+  day4 제어 대시보드 — 두 보드를 한 페이지에서 보고, 각각 켜고 끈다.
+
+  index.html 은 보기만 하는 페이지(보드 -> 브라우저 단방향)였다.
+  이 페이지는 명령 토픽을 얹어서 양방향이 된다.
+
+    보기   wearable/{id}/gesture            노드가 250 ms 마다 발행
+           wearable/{id}/vision             노드가 700 ms 마다 발행
+    생사   wearable/{id}/status/<node>      "online" / "offline"(보드 LWT, retained)
+    제어   wearable/{id}/cmd/<node>         {"active":true,"rate_ms":250}  (retained 로 발행)
+
+  명령을 retained 로 보내는 이유: 보드를 리셋하거나 나중에 켜도, 구독하는 순간
+  브로커가 마지막 명령을 되돌려주므로 마지막 상태가 그대로 이어진다.
+  펌웨어: ../50_gesture_ctrl (카메라 없는 보드) , ../51_vision_ctrl (Sense 보드)
+-->
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wearable Sensor Nodes — Control</title>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+:root{
+  --bg:#0b0d12; --bg2:#12151d;
+  --card:rgba(255,255,255,.035); --card-hi:rgba(255,255,255,.06);
+  --line:rgba(255,255,255,.08);
+  --text:#eef1f7; --muted:#7d879c;
+  --accent:#5b9dff; --ok:#35d07f; --warn:#ffb84d; --off:#ff5f57;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.6);
+  --r:16px;
+}
+@media (prefers-color-scheme:light){
+  :root{
+    --bg:#eef1f6; --bg2:#f8fafc; --card:#fff; --card-hi:#fff;
+    --line:rgba(15,23,42,.09); --text:#0f172a; --muted:#64748b;
+    --shadow:0 1px 2px rgba(15,23,42,.06),0 12px 28px -18px rgba(15,23,42,.4);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0b0d12; --bg2:#12151d; --card:rgba(255,255,255,.035); --card-hi:rgba(255,255,255,.06);
+  --line:rgba(255,255,255,.08); --text:#eef1f7; --muted:#7d879c;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.6);
+}
+:root[data-theme="light"]{
+  --bg:#eef1f6; --bg2:#f8fafc; --card:#fff; --card-hi:#fff;
+  --line:rgba(15,23,42,.09); --text:#0f172a; --muted:#64748b;
+  --shadow:0 1px 2px rgba(15,23,42,.06),0 12px 28px -18px rgba(15,23,42,.4);
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{
+  min-height:100vh;
+  background:
+    radial-gradient(1100px 600px at 12% -10%, rgba(91,157,255,.13), transparent 60%),
+    radial-gradient(900px 500px at 105% 8%, rgba(53,208,127,.10), transparent 55%),
+    var(--bg);
+  color:var(--text);
+  font:15px/1.55 -apple-system,"Segoe UI Variable Text","Segoe UI",system-ui,"Pretendard",sans-serif;
+  padding:32px 20px 64px;
+}
+.wrap{max-width:1180px;margin:0 auto}
+
+header{display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:22px}
+h1{font-size:26px;font-weight:680;letter-spacing:-.02em}
+h1 span{background:linear-gradient(92deg,var(--accent),#9b7bff);
+        -webkit-background-clip:text;background-clip:text;color:transparent}
+.tag{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+     color:var(--muted);border:1px solid var(--line);border-radius:999px;
+     padding:4px 10px;margin-bottom:4px}
+
+/* ---------- connection bar ---------- */
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+     background:var(--card);border:1px solid var(--line);
+     border-radius:var(--r);padding:12px 14px;margin-bottom:22px;
+     box-shadow:var(--shadow);backdrop-filter:blur(12px)}
+.field{display:flex;align-items:center;gap:7px}
+.field label{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+input{background:var(--bg2);color:var(--text);border:1px solid var(--line);border-radius:9px;
+      padding:8px 11px;font:inherit;font-size:14px;transition:border-color .15s,box-shadow .15s}
+input:focus{outline:0;border-color:var(--accent);box-shadow:0 0 0 3px rgba(91,157,255,.16)}
+#host{width:150px}#port{width:74px}#sid{width:118px}
+button{border:0;border-radius:9px;padding:9px 18px;font:inherit;font-size:14px;font-weight:600;
+       color:#fff;background:linear-gradient(180deg,var(--accent),#3f7fe0);cursor:pointer;
+       transition:transform .12s,filter .15s,opacity .15s}
+button:hover:not(:disabled){filter:brightness(1.08)}
+button:active:not(:disabled){transform:translateY(1px)}
+button:disabled{opacity:.38;cursor:not-allowed}
+button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+button.ghost:hover:not(:disabled){background:var(--card-hi)}
+.status{display:flex;align-items:center;gap:8px;margin-left:auto;font-size:13px;color:var(--muted)}
+.dot{position:relative;width:9px;height:9px;border-radius:50%;background:var(--off);transition:background .25s}
+.dot.on{background:var(--ok)}
+.dot.on::after{content:"";position:absolute;inset:-5px;border-radius:50%;
+               border:1.5px solid var(--ok);animation:pulse 1.9s ease-out infinite}
+@keyframes pulse{0%{opacity:.7;transform:scale(.6)}100%{opacity:0;transform:scale(1.5)}}
+
+/* ---------- node layout ---------- */
+.nodes{display:grid;grid-template-columns:repeat(auto-fit,minmax(460px,1fr));gap:18px}
+@media (max-width:980px){.nodes{grid-template-columns:1fr}}
+
+.node{position:relative;overflow:hidden;background:var(--card);border:1px solid var(--line);
+      border-radius:var(--r);padding:18px 18px 20px;box-shadow:var(--shadow);
+      backdrop-filter:blur(12px);transition:opacity .3s,border-color .2s}
+.node::before{content:"";position:absolute;inset:0 0 auto 0;height:2px;
+              background:linear-gradient(90deg,var(--tint),transparent 72%)}
+#n-gesture{--tint:#5b9dff}
+#n-vision{--tint:#35d07f}
+.node.stale{opacity:.34}
+
+.nhead{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.nhead h2{font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text)}
+.nhead .kind{font-size:11px;color:var(--muted);border:1px solid var(--line);
+             border-radius:999px;padding:3px 9px}
+.nhead .meta{margin-left:auto;font-size:11px;color:var(--muted);
+             font-variant-numeric:tabular-nums;text-align:right;line-height:1.4}
+
+/* ---------- 노드별 제어 줄 ---------- */
+.ctl{display:flex;align-items:center;gap:9px;flex-wrap:wrap;
+     background:var(--bg2);border:1px solid var(--line);border-radius:12px;
+     padding:9px 11px;margin-bottom:16px}
+.ctl .pill{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;
+           letter-spacing:.08em;text-transform:uppercase;color:var(--muted);
+           border:1px solid var(--line);border-radius:999px;padding:4px 10px}
+.ctl .pill .d{width:7px;height:7px;border-radius:50%;background:var(--off)}
+.ctl .pill.live{color:var(--ok)} .ctl .pill.live .d{background:var(--ok)}
+.ctl .pill.run{color:var(--tint)} .ctl .pill.run .d{background:var(--tint)}
+.ctl button{padding:7px 15px;font-size:13px}
+.ctl button.stopbtn{background:linear-gradient(180deg,#ff7a72,#e2564d)}
+.ctl .rate{display:flex;align-items:center;gap:6px;margin-left:auto;
+           font-size:11px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase}
+.ctl .rate input{width:82px;padding:6px 9px;font-size:13px}
+
+.sec{font-size:10.5px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+     color:var(--muted);margin:4px 0 10px;display:flex;align-items:center;gap:8px}
+.sec::after{content:"";flex:1;height:1px;background:var(--line)}
+
+/* ---------- inference block ---------- */
+.infer{display:flex;gap:16px;align-items:center;margin-bottom:6px}
+.ring{position:relative;width:104px;height:104px;flex:none}
+.ring svg{width:100%;height:100%;transform:rotate(-90deg)}
+.ring .bg{fill:none;stroke:var(--line);stroke-width:9}
+.ring .fg{fill:none;stroke:var(--tint);stroke-width:9;stroke-linecap:round;
+          transition:stroke-dashoffset .4s cubic-bezier(.2,.8,.2,1)}
+.ring .txt{position:absolute;inset:0;display:flex;flex-direction:column;
+           align-items:center;justify-content:center;gap:1px}
+.ring .pct{font-size:22px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.ring .cap{font-size:9.5px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase}
+.ilabel{min-width:0}
+.ilabel .big{font-size:30px;font-weight:650;letter-spacing:-.02em;
+             text-transform:uppercase;line-height:1.15;word-break:break-all}
+.ilabel .lat{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums;margin-top:5px}
+/* 추론이 정지된 노드: 추론 블록만 흐리게 (원시 센서값은 계속 살아 있다) */
+.inferwrap{transition:opacity .25s}
+.node.paused .inferwrap{opacity:.3}
+
+.scores{margin-top:12px;display:flex;flex-direction:column;gap:8px}
+.srow{display:grid;grid-template-columns:88px 1fr 44px;align-items:center;gap:10px}
+.srow .nm{font-size:12.5px;font-weight:550;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.srow .tr{height:9px;border-radius:999px;background:var(--bg2);
+          box-shadow:inset 0 0 0 1px var(--line);overflow:hidden}
+.srow .fl{height:100%;width:0;border-radius:999px;background:var(--tint);
+          transition:width .35s cubic-bezier(.2,.8,.2,1)}
+.srow .pc{font-size:12px;text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
+.srow.top .nm{color:var(--tint)}
+.srow.top .pc{color:var(--text);font-weight:600}
+
+/* ---------- raw sensors ---------- */
+.sensors{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:9px;margin-top:4px}
+.s{background:var(--bg2);border:1px solid var(--line);border-radius:11px;padding:10px 11px 9px}
+.s .lab{font-size:10.5px;color:var(--muted);letter-spacing:.04em;
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.s .val{font-size:21px;font-weight:600;font-variant-numeric:tabular-nums;
+        letter-spacing:-.02em;margin-top:2px;line-height:1.2}
+.s .val .u{font-size:11px;font-weight:400;color:var(--muted);margin-left:3px}
+.s .sp{display:block;width:100%;height:24px;margin-top:5px}
+@keyframes flash{0%{color:var(--tint)}100%{color:inherit}}
+.hit{animation:flash .5s ease-out}
+.empty{font-size:12.5px;color:var(--muted);padding:6px 0}
+
+/* ---------- log ---------- */
+.logwrap{margin-top:22px}
+.logwrap h2{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+            color:var(--muted);margin-bottom:9px}
+#log{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+     padding:14px 16px;height:150px;overflow-y:auto;
+     font:12px/1.75 ui-monospace,"Cascadia Mono",Consolas,monospace;
+     color:var(--muted);white-space:pre-wrap;word-break:break-all;box-shadow:var(--shadow)}
+#log::-webkit-scrollbar{width:9px}
+#log::-webkit-scrollbar-thumb{background:var(--line);border-radius:9px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Wearable <span>Node Control</span></h1>
+    <div class="tag">MQTT over WebSocket · 보기 + 제어</div>
+  </header>
+
+  <div class="bar">
+    <div class="field"><label for="host">broker</label><input id="host" value="192.168.0.27"></div>
+    <div class="field"><label for="port">port</label><input id="port" value="9001"></div>
+    <div class="field"><label for="sid">id</label><input id="sid" value="minseo"></div>
+    <button id="connect">연결</button>
+    <button id="disconnect" class="ghost" disabled>끊기</button>
+    <button id="allon" class="ghost" disabled>전체 시작</button>
+    <button id="alloff" class="ghost" disabled>전체 정지</button>
+    <div class="status"><span class="dot" id="dot"></span><span id="stateText">연결 안 됨</span></div>
+  </div>
+
+  <div class="nodes" id="nodes"></div>
+
+  <div class="logwrap">
+    <h2>Log</h2>
+    <div id="log">대기 중…</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+// 노드 정의. 노드를 늘리려면 여기에 한 줄 추가하면 끝 —
+// id 는 그 보드가 쓰는 토픽 suffix(wearable/{sid}/<id>)와 반드시 같아야 한다.
+const NODES = [
+  {id:'gesture', title:'노드 1 · 제스처', kind:'BNO055 IMU · 카메라 없는 보드', rate:250},
+  {id:'vision',  title:'노드 2 · 시각',   kind:'OV2640 · XIAO ESP32S3 Sense',   rate:700},
+];
+const STALE_MS = 4000;      // 이 시간 동안 메시지가 없으면 카드를 흐리게
+
+let client = null, base = '';
+const state = {};           // id -> {el, seenAt, spark:{key:[..]}, active}
+
+function log(msg){
+  const el = $('log'), t = new Date().toLocaleTimeString();
+  el.textContent += `\n[${t}] ${msg}`;
+  el.scrollTop = el.scrollHeight;
+}
+
+// ---------- 명령 발행 ----------
+// retained(true) 로 보낸다: 보드가 나중에 켜져도 구독하는 순간 마지막 명령을 받는다.
+function sendCmd(id, active){
+  if(!client || !client.connected){ log('브로커에 연결한 뒤에 눌러 주세요'); return; }
+  const st = state[id];
+  const rate = Math.round(Number(st.el.querySelector('[data-rate]').value)) || st.def.rate;
+  const msg = JSON.stringify({active:!!active, rate_ms:rate});
+  client.publish(`${base}/cmd/${id}`, msg, {retain:true, qos:0});
+  log(`명령 -> ${base}/cmd/${id}  ${msg}`);
+}
+
+// ---------- 카드 뼈대 만들기 ----------
+function buildCards(){
+  const root = $('nodes');
+  root.innerHTML = '';
+  for(const n of NODES){
+    const el = document.createElement('section');
+    el.className = 'node stale';
+    el.id = 'n-' + n.id;
+    el.innerHTML = `
+      <div class="nhead">
+        <h2>${n.title}</h2>
+        <span class="kind">${n.kind}</span>
+        <span class="meta" data-meta>—</span>
+      </div>
+
+      <div class="ctl">
+        <span class="pill" data-online><span class="d"></span><span data-onlinetxt>offline</span></span>
+        <span class="pill" data-runstate><span class="d"></span><span data-runtxt>정지</span></span>
+        <button data-start>시작</button>
+        <button data-stop class="stopbtn">정지</button>
+        <span class="rate">주기(ms)<input type="number" data-rate value="${n.rate}" min="100" max="10000" step="50"></span>
+      </div>
+
+      <div class="inferwrap">
+        <div class="sec">추론 결과</div>
+        <div class="infer">
+          <div class="ring">
+            <svg viewBox="0 0 100 100">
+              <circle class="bg" cx="50" cy="50" r="43"></circle>
+              <circle class="fg" cx="50" cy="50" r="43"
+                      stroke-dasharray="270.18" stroke-dashoffset="270.18" data-ring></circle>
+            </svg>
+            <div class="txt">
+              <span class="pct" data-pct>—</span>
+              <span class="cap">conf</span>
+            </div>
+          </div>
+          <div class="ilabel">
+            <div class="big" data-label>—</div>
+            <div class="lat" data-lat>대기 중</div>
+          </div>
+        </div>
+        <div class="scores" data-scores></div>
+      </div>
+
+      <div class="sec" style="margin-top:18px">원시 센서값</div>
+      <div class="sensors" data-sensors><div class="empty">수신 대기 중…</div></div>
+    `;
+    root.appendChild(el);
+    state[n.id] = {el, def:n, seenAt:0, spark:{}, active:null};
+
+    el.querySelector('[data-start]').onclick = () => sendCmd(n.id, true);
+    el.querySelector('[data-stop]').onclick  = () => sendCmd(n.id, false);
+    // 주기를 바꾸면 지금 상태(켜짐/꺼짐)를 유지한 채 새 주기만 보낸다
+    el.querySelector('[data-rate]').onchange = () => {
+      if(state[n.id].active !== null) sendCmd(n.id, state[n.id].active);
+    };
+  }
+}
+
+// ---------- 스파크라인 ----------
+const SPARK_N = 60;
+function drawSpark(canvas, series, lo, hi){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = canvas.clientWidth || 110, h = 24;
+  if(canvas.width !== Math.round(w*dpr) || canvas.height !== Math.round(h*dpr)){
+    canvas.width = Math.round(w*dpr); canvas.height = Math.round(h*dpr);
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  if(series.length < 2) return;
+
+  // 들어온 min/max 를 기준으로 하되, 실제 데이터가 그 밖으로 나가면 넓힌다
+  let mn = lo, mx = hi;
+  for(const v of series){ if(v < mn) mn = v; if(v > mx) mx = v; }
+  if(mx - mn < 1e-6) mx = mn + 1;
+
+  const tint = getComputedStyle(canvas.closest('.node')).getPropertyValue('--tint').trim() || '#5b9dff';
+  const pad = 2;
+  const x = i => (i / (SPARK_N - 1)) * w;
+  const y = v => h - pad - ((v - mn) / (mx - mn)) * (h - pad*2);
+  const off = SPARK_N - series.length;   // 오른쪽 끝이 최신이 되도록 오프셋
+
+  ctx.beginPath();
+  ctx.moveTo(x(off), y(series[0]));
+  for(let i=1;i<series.length;i++) ctx.lineTo(x(off+i), y(series[i]));
+  ctx.strokeStyle = tint; ctx.lineWidth = 1.6;
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.globalAlpha = .9; ctx.stroke(); ctx.globalAlpha = 1;
+
+  ctx.beginPath();
+  ctx.arc(x(off+series.length-1), y(series[series.length-1]), 2, 0, Math.PI*2);
+  ctx.fillStyle = tint; ctx.fill();
+}
+
+// ---------- 원시 센서값 렌더 ----------
+function renderSensors(st, sensors){
+  const host = st.el.querySelector('[data-sensors]');
+  const keys = Object.keys(sensors || {});
+  if(!keys.length){ host.innerHTML = '<div class="empty">이 노드가 보낸 센서값이 없습니다</div>'; return; }
+
+  if(host.querySelector('.empty')) host.innerHTML = '';
+
+  for(const k of keys){
+    const s = sensors[k];
+    if(!s || typeof s.v !== 'number') continue;
+
+    let cell = host.querySelector(`[data-s="${k}"]`);
+    if(!cell){
+      cell = document.createElement('div');
+      cell.className = 's';
+      cell.dataset.s = k;
+      cell.innerHTML = `<div class="lab">${s.label || k}</div>
+                        <div class="val" data-v>—</div>
+                        <canvas class="sp" data-sp></canvas>`;
+      host.appendChild(cell);
+      st.spark[k] = [];
+    }
+
+    const v = cell.querySelector('[data-v]');
+    const u = s.unit ? `<span class="u">${s.unit}</span>` : '';
+    // 소수 자릿수는 값의 크기에 맞춰서 (1004.9 hPa 는 1자리, 0.08 m/s² 는 2자리)
+    const digits = Math.abs(s.v) >= 100 ? 1 : 2;
+    v.innerHTML = s.v.toFixed(digits) + u;
+    v.classList.remove('hit'); void v.offsetWidth; v.classList.add('hit');
+
+    const ser = st.spark[k] || (st.spark[k] = []);
+    ser.push(s.v);
+    if(ser.length > SPARK_N) ser.shift();
+    drawSpark(cell.querySelector('[data-sp]'), ser,
+              typeof s.min === 'number' ? s.min : Math.min(...ser),
+              typeof s.max === 'number' ? s.max : Math.max(...ser));
+  }
+}
+
+// ---------- 추론 결과 렌더 ----------
+const RING_C = 2 * Math.PI * 43;
+function renderInference(st, inf){
+  if(!inf) return;
+  const conf = Math.max(0, Math.min(1, inf.confidence || 0));
+
+  st.el.querySelector('[data-label]').textContent = inf.label || '—';
+  st.el.querySelector('[data-pct]').textContent = Math.round(conf*100) + '%';
+  st.el.querySelector('[data-ring]').style.strokeDashoffset = (RING_C * (1 - conf)).toFixed(2);
+
+  const dsp = inf.dsp_ms|0, nn = inf.nn_ms|0;
+  st.el.querySelector('[data-lat]').textContent = `dsp ${dsp}ms + nn ${nn}ms = ${dsp+nn}ms`;
+
+  const host = st.el.querySelector('[data-scores]');
+  const scores = inf.scores || {};
+  for(const k of Object.keys(scores)){
+    let row = host.querySelector(`[data-sc="${k}"]`);
+    if(!row){
+      row = document.createElement('div');
+      row.className = 'srow';
+      row.dataset.sc = k;
+      row.innerHTML = `<span class="nm">${k}</span>
+                       <div class="tr"><div class="fl" data-fl></div></div>
+                       <span class="pc" data-pc>0%</span>`;
+      host.appendChild(row);
+    }
+    const v = Math.max(0, Math.min(1, scores[k] || 0));
+    row.querySelector('[data-fl]').style.width = (v*100).toFixed(1) + '%';
+    row.querySelector('[data-pc]').textContent = Math.round(v*100) + '%';
+    row.classList.toggle('top', k === inf.label);
+  }
+}
+
+// ---------- 실행 상태 뱃지 ----------
+function renderRunState(st, active){
+  st.active = active;
+  const pill = st.el.querySelector('[data-runstate]');
+  pill.classList.toggle('run', !!active);
+  st.el.querySelector('[data-runtxt]').textContent = active ? '추론 중' : '정지';
+  st.el.classList.toggle('paused', !active);
+  if(!active){
+    // 정지하면 마지막 추론 결과가 그대로 남아 "아직 돌고 있는 것처럼" 보인다. 비운다.
+    st.el.querySelector('[data-label]').textContent = '정지';
+    st.el.querySelector('[data-pct]').textContent = '—';
+    st.el.querySelector('[data-ring]').style.strokeDashoffset = RING_C.toFixed(2);
+    st.el.querySelector('[data-lat]').textContent = '대시보드에서 정지시킴';
+    st.el.querySelectorAll('.srow').forEach(r => {
+      r.querySelector('[data-fl]').style.width = '0%';
+      r.querySelector('[data-pc]').textContent = '0%';
+      r.classList.remove('top');
+    });
+  }
+}
+
+// ---------- 메시지 수신 ----------
+function onMessage(topic, buf){
+  const rest = topic.slice(base.length + 1);      // wearable/{sid}/xxx -> xxx
+
+  // 생사 토픽 (보드 LWT / 접속 직후 online)
+  if(rest.startsWith('status/')){
+    const st = state[rest.slice(7)];
+    if(!st) return;
+    const online = buf.toString().trim() === 'online';
+    const pill = st.el.querySelector('[data-online]');
+    pill.classList.toggle('live', online);
+    st.el.querySelector('[data-onlinetxt]').textContent = online ? 'online' : 'offline';
+    log(`${rest} = ${buf.toString().trim()}`);
+    return;
+  }
+
+  // 다른 대시보드/CLI 가 보낸 명령도 같이 본다 (버튼 상태를 서로 맞추기 위해)
+  if(rest.startsWith('cmd/')) return;
+
+  const st = state[rest];
+  if(!st){ log(`알 수 없는 토픽: ${topic}`); return; }
+
+  let d;
+  try { d = JSON.parse(buf.toString()); }
+  catch(e){ log(`JSON 파싱 실패 (${topic})`); return; }
+
+  st.seenAt = Date.now();
+  st.el.classList.remove('stale');
+
+  const rssi = typeof d.rssi === 'number' ? `${d.rssi} dBm` : '—';
+  const up   = typeof d.uptime_s === 'number' ? `${d.uptime_s}s` : '—';
+  st.el.querySelector('[data-meta]').innerHTML = `RSSI ${rssi}<br>uptime ${up}`;
+
+  // active 는 "보드가 실제로 그렇게 하고 있다"는 보고다. 버튼이 아니라 이걸 믿는다.
+  const active = d.active !== false;
+  if(active !== st.active) renderRunState(st, active);
+  // 보드가 알려준 실제 주기를 입력칸에 반영 (다른 사람이 바꿨을 수도 있다)
+  const rateBox = st.el.querySelector('[data-rate]');
+  if(typeof d.rate_ms === 'number' && document.activeElement !== rateBox) rateBox.value = d.rate_ms;
+
+  if(active) renderInference(st, d.inference);
+  renderSensors(st, d.sensors);
+}
+
+// 일정 시간 소식 없으면 흐리게 (노드가 죽었는지 바로 보이도록)
+setInterval(() => {
+  const now = Date.now();
+  for(const id in state){
+    const st = state[id];
+    st.el.classList.toggle('stale', !st.seenAt || now - st.seenAt > STALE_MS);
+  }
+}, 1000);
+
+// ---------- 연결 ----------
+function setConnected(ok){
+  $('dot').classList.toggle('on', ok);
+  $('stateText').textContent = ok ? '연결됨' : '연결 안 됨';
+  $('connect').disabled = ok;
+  $('disconnect').disabled = !ok;
+  $('allon').disabled = !ok;
+  $('alloff').disabled = !ok;
+  if(!ok) for(const id in state) state[id].el.classList.add('stale');
+}
+
+function connect(){
+  const host = $('host').value.trim(), port = $('port').value.trim(), sid = $('sid').value.trim();
+  base = `wearable/${sid}`;
+
+  // https 로 열린 페이지에서는 브라우저가 ws:// 를 막는다. 그때는 wss 가 필요하다.
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${scheme}://${host}:${port}`;
+  log(`연결 시도: ${url}`);
+
+  client = mqtt.connect(url, {
+    clientId: 'dash-' + Math.random().toString(16).slice(2,8),
+    reconnectPeriod: 3000,
+    connectTimeout: 8000,
+  });
+
+  client.on('connect', () => {
+    setConnected(true);
+    log('브로커 연결 성공');
+    const subs = [];
+    for(const n of NODES){ subs.push(`${base}/${n.id}`, `${base}/status/${n.id}`); }
+    client.subscribe(subs, err => log(err ? '구독 실패: '+err.message : '구독: '+subs.join(', ')));
+  });
+  client.on('message', onMessage);
+  client.on('reconnect', () => log('재연결 시도…'));
+  client.on('close', () => setConnected(false));
+  client.on('error', err => log('에러: ' + err.message));
+}
+
+function disconnect(){
+  if(client){ client.end(true); client = null; }
+  setConnected(false);
+  log('연결 종료');
+}
+
+$('connect').onclick = connect;
+$('disconnect').onclick = disconnect;
+$('allon').onclick  = () => NODES.forEach(n => sendCmd(n.id, true));
+$('alloff').onclick = () => NODES.forEach(n => sendCmd(n.id, false));
+window.addEventListener('resize', () => {
+  for(const id in state){
+    const st = state[id];
+    st.el.querySelectorAll('[data-s]').forEach(cell => {
+      const k = cell.dataset.s;
+      if(st.spark[k]) drawSpark(cell.querySelector('[data-sp]'), st.spark[k], 0, 1);
+    });
+  }
+});
+
+buildCards();
+setConnected(false);
+</script>
+</body>
+</html>
