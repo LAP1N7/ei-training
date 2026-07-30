@@ -116,6 +116,10 @@ void publishState() {
   String j = "{\"node\":\"" + String(NODE_ID) + "\",\"kind\":\"camera\"";
   j += ",\"uptime_s\":" + String(millis() / 1000);
   j += ",\"rssi\":" + String(WiFi.RSSI());
+  // [+] 자기 IP 를 같이 실어 보낸다. 클록 노드가 미션 중에 http://<이 IP>/jpg 를
+  // 받아 라운드 디스플레이에 그리는데, IP 는 DHCP 라 실제로 바뀐다 (겪었다).
+  // 하드코딩하면 망이 바뀔 때마다 두 스케치를 다시 구워야 한다.
+  j += ",\"ip\":\"" + WiFi.localIP().toString() + "\"";
 
   j += ",\"sensors\":{";
   bool first = true;
