@@ -96,6 +96,11 @@ const char *NODE_ID    = "gesture";
 #define C_FAIL     0xF9E7
 
 // ---- [D] 사물 미션용 카메라 뷰파인더 ----
+// 비전 노드 주소는 두 경로로 얻는다:
+//   1) MQTT 의 vision 발행에 있는 "ip" (있으면 이게 우선 — DHCP 로 바뀌어도 따라간다)
+//   2) 없으면 아래 폴백. 지금 돌고 있는 비전 노드 펌웨어는 ip 를 안 실어 보내므로
+//      이 값으로 붙는다. 비전 노드를 다시 구우면 1) 이 자동으로 덮어쓴다.
+#define VISION_IP_FALLBACK "192.168.0.94"
 #define CAM_INTRO_MS   3000                // 미션 이미지를 보여주는 시간, 그 뒤 카메라로 전환
 #define CAM_FETCH_MS   400
 #define CAM_TIMEOUT_MS 1500
@@ -128,7 +133,7 @@ static uint32_t lastUi = 0;
 static uint32_t lastFrame = 0, missionAt = 0;
 
 // ---- [D] 카메라 뷰파인더 ----
-static char     visionIp[20] = "";
+static char     visionIp[20] = VISION_IP_FALLBACK;
 static uint8_t *camBuf   = nullptr;
 static size_t   camLen   = 0;
 static uint32_t camAt    = 0;
